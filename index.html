@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kite Advisor</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:16px;background:#f6f7f9;color:#222}
+h1{margin:0 0 4px} .sub{color:#666;font-size:13px;margin-bottom:12px}
+form{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:16px;font-size:14px}
+input{width:52px;padding:3px} input.sizes{width:190px} .kite{font-weight:bold;color:#05a} button{padding:5px 14px;cursor:pointer}
+.day{background:#fff;border-radius:8px;padding:12px;margin-bottom:16px;box-shadow:0 1px 3px #0002;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:5px 8px;border-bottom:1px solid #eee;text-align:left;white-space:nowrap}
+th{font-size:12px;color:#666} .go{background:#d6f5d6;font-weight:bold} .maybe{background:#fff3c4} .no{color:#999}
+.best{font-size:16px;margin:4px 0 10px} .note{color:#777;font-size:12px;white-space:normal;min-width:200px}
+.m{font-size:12px;color:#555} a{color:#06c} #status{color:#a00}
+</style>
+</head>
+<body>
+<h1>Kite Advisor</h1>
+<div class="sub">Fonte: Open-Meteo (ECMWF, ICON, ICON-2I, AROME, GFS). "Accordo" = quota di modelli che danno vento utile nel settore giusto. Clicca uno spot per aprirlo su Windy.
+Direzione = media vettoriale pesata sulla velocita' (le ore di calma non la falsano); "incerta" se i modelli non concordano.
+Vela: 2.2 &times; peso / vento, con il vento alzato del 30% della differenza raffica-media (bora rafficata = vela piu' piccola). Nei campi Reach / Evo SLS metti le misure che hai.</div>
+<form id="opts">
+  <label>Vento min <input id="min" type="number" value="12"> kn</label>
+  <label>max <input id="max" type="number" value="32"> kn</label>
+  <label>dalle <input id="start" type="number" value="9"></label>
+  <label>alle <input id="end" type="number" value="19"></label>
+  <label>giorni <input id="days" type="number" value="5" min="1" max="7"></label>
+  <label>peso <input id="weight" type="number" value="75"> kg</label>
+  <label>Reach <input id="reach" class="sizes" value="12"> m&sup2;</label>
+  <label>Evo SLS <input id="evo" class="sizes" value="12"> m&sup2;</label>
+  <button>Aggiorna</button>
+</form>
+<div id="status">Se questa scritta non sparisce, il file e' aperto in un'anteprima che non esegue JavaScript
+(WhatsApp, Drive, Gmail, File di iPhone): aprilo con Chrome o Safari ("Apri con...").</div>
+<noscript><b>JavaScript e' disattivato: apri il file con Chrome o Safari.</b></noscript>
+<div id="out"></div>
+<script>
+// gli errori di sintassi o di esecuzione compaiono a schermo invece di lasciare la pagina ferma
+window.onerror = function (msg, src, line) {
+  document.getElementById("status").textContent = "Errore JavaScript: " + msg + " (riga " + line + ")";
+};
+</script>
+
+<script>
+// Modelli confrontati (nome Open-Meteo -> etichetta)
+const MODELS = {
+  ecmwf_ifs025: "ECMWF",
+  icon_seamless: "ICON",
+  italia_meteo_arpae_icon_2i: "ICON-2I",
+  meteofrance_seamless: "AROME",
+  gfs_seamless: "GFS",
+};
+
+// dirs = settori di provenienza del vento buoni (gradi, da..a in senso orario).
+// cell "sea": cella di griglia sull'acqua (sulla terra l'attrito abbassa il vento).
+const SPOTS = [
+  {name: "Sottomarina (diga)", lat: 45.205, lon: 12.305, sea: true, cell: "sea",
+   dirs: [[20, 170]], note: "Bora, Levante, Scirocco. Ponente = offshore!"},
+  {name: "Conche (Codevigo)", lat: 45.262, lon: 12.205, sea: false, cell: "sea",
+   dirs: [[20, 210]], note: "Laguna, acqua piatta: controlla la marea."},
+  {name: "Jesolo", lat: 45.490, lon: 12.640, sea: true, cell: "sea",
+   dirs: [[40, 210]], note: "Scirocco/Levante; Bora side-shore."},
+  {name: "Caorle", lat: 45.590, lon: 12.880, sea: true, cell: "sea",
+   dirs: [[60, 220]], note: "Scirocco/Levante e termica da S."},
+  {name: "Grado", lat: 45.670, lon: 13.390, sea: true, cell: "sea",
+   dirs: [[100, 250]], note: "Scirocco, termica SW. Bora offshore!"},
+  {name: "Volano", lat: 44.800, lon: 12.280, sea: true, cell: "sea",
+   dirs: [[20, 170]], note: "Bora, Levante, Scirocco."},
+  {name: "Lago di Garda (nord)", lat: 45.800, lon: 10.830, sea: false, cell: "sea",
+   names: [[150, 220, "Ora"], [330, 30, "Peler"]],
+   dirs: [[150, 220], [330, 30]], note: "Ora (S) pomeriggio / Peler (N) mattina. I modelli sottostimano le termiche."},
+  {name: "Lago di Santa Croce", lat: 46.120, lon: 12.340, sea: false, cell: "nearest",
+   names: [[150, 220, "Termica S"], [330, 40, "Nord (Fadalto)"]],
+   dirs: [[150, 220], [330, 40]], note: "Termica da S nel pomeriggio, N dal Fadalto. Modelli sottostimano le termiche."},
+];
+
+// Nomi dei venti in Alto Adriatico (settore di provenienza)
+const WIND_NAMES = [[340, 20, "Tramontana"], [20, 80, "Bora"], [80, 110, "Levante"], [110, 160, "Scirocco"],
+  [160, 200, "Ostro"], [200, 250, "Libeccio"], [250, 290, "Ponente"], [290, 340, "Maestrale"]];
+const windName = (d, spot) =>
+  [...(spot.names || []), ...WIND_NAMES].find(([a, b]) => dirOk(d, [[a, b]]))[2];
+
+// Media vettoriale pesata sulla velocita': [[speed, dir], ...] -> {dir, r}; r = 1 tutti concordi, 0 opposti
+function vecMean(pairs) {
+  let x = 0, y = 0, tot = 0;
+  for (const [sp, d] of pairs) { x += sp * Math.sin(rad(d)); y += sp * Math.cos(rad(d)); tot += sp; }
+  return {dir: (Math.atan2(x, y) * 180 / Math.PI + 360) % 360, r: tot ? Math.hypot(x, y) / tot : 0};
+}
+
+// Misura vela: ideale = 2.2 * peso / vento effettivo, poi la misura disponibile piu' vicina
+function kiteSize(wind, gust, weight, sizes) {
+  if (!sizes.length || wind < 5) return "-";
+  const eff = wind + 0.3 * Math.max(0, gust - wind);
+  const ideal = 2.2 * weight / eff;
+  const best = sizes.reduce((a, b) => Math.abs(b - ideal) < Math.abs(a - ideal) ? b : a);
+  if (ideal > Math.max(...sizes) + 1.5) return `${best} (poco vento)`;
+  if (ideal < Math.min(...sizes) - 1) return `${best} (troppo vento!)`;
+  return String(best);
+}
+
+const CARDINALS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const WEEKDAYS = ["Dom","Lun","Mar","Mer","Gio","Ven","Sab"];
+const cardinal = d => CARDINALS[Math.floor((d % 360) / 22.5 + 0.5) % 16];
+const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+const median = a => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+const rad = d => d * Math.PI / 180;
+// valore i-esimo di un array che puo' mancare (null se assente)
+const at = (arr, i) => (arr && arr[i] != null) ? arr[i] : null;
+const dirOk = (d, sectors) => sectors.some(([a, b]) => a <= b ? (d >= a && d <= b) : (d >= a || d <= b));
+const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+async function getJson(base, params) {
+  // timeout: su rete mobile lenta meglio un errore chiaro che un caricamento infinito
+  const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 30000);
+  let r;
+  try {
+    r = await fetch(base + "?" + new URLSearchParams(params).toString().replace(/%2C/g, ","), {signal: ctrl.signal});
+  } catch (e) {
+    throw new Error(e.name === "AbortError" ? "nessuna risposta da Open-Meteo in 30 s (connessione?)"
+      : "impossibile contattare Open-Meteo (" + e.message + ")");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!r.ok) throw new Error(`${base}: HTTP ${r.status}`);
+  const d = await r.json();
+  return Array.isArray(d) ? d : [d];
+}
+
+async function fetchAll(days) {
+  const common = {timezone: "Europe/Rome", forecast_days: days};
+  const coords = g => ({latitude: g.map(s => s.lat).join(","), longitude: g.map(s => s.lon).join(",")});
+  const wind = {}, waves = {};
+  const jobs = ["sea", "nearest"].map(async cell => {
+    const g = SPOTS.filter(s => s.cell === cell);
+    if (!g.length) return;
+    const res = await getJson("https://api.open-meteo.com/v1/forecast", {
+      ...common, ...coords(g), cell_selection: cell, wind_speed_unit: "kn",
+      hourly: "wind_speed_10m,wind_gusts_10m,wind_direction_10m",
+      models: Object.keys(MODELS).join(",")});
+    g.forEach((s, i) => wind[s.name] = res[i].hourly);
+  });
+  const seaSpots = SPOTS.filter(s => s.sea);
+  jobs.push(getJson("https://marine-api.open-meteo.com/v1/marine", {
+    ...common, ...coords(seaSpots), hourly: "wave_height,wave_period"})
+    .then(res => seaSpots.forEach((s, i) => waves[s.name] = res[i].hourly)));
+  await Promise.all(jobs);
+  return SPOTS.map(s => [s, wind[s.name], waves[s.name]]);
+}
+
+function analyse(spot, hourly, marine, o) {
+  const days = {};
+  hourly.time.forEach((t, i) => {
+    const hour = +t.slice(11, 13);
+    if (hour < o.start || hour > o.end) return;
+    const perModel = {};
+    for (const [m, label] of Object.entries(MODELS)) {
+      const sp = at(hourly[`wind_speed_10m_${m}`], i), dr = at(hourly[`wind_direction_10m_${m}`], i);
+      const gu = at(hourly[`wind_gusts_10m_${m}`], i);
+      if (sp != null && dr != null) perModel[label] = [sp, dr, gu];
+    }
+    const vals = Object.values(perModel);
+    if (!vals.length) return;
+    const good = vals.filter(([sp, dr]) => sp >= o.min && sp <= o.max && dirOk(dr, spot.dirs));
+    const agree = good.length / vals.length;
+    const key = t.slice(0, 10);
+    if (!days[key]) days[key] = {hours: [], score: 0, models: {}};
+    const d = days[key];
+    d.score += agree;
+    for (const [l, [sp, dr]] of Object.entries(perModel)) {
+      if (!d.models[l]) d.models[l] = [];
+      d.models[l].push([sp, dr, hour]);
+    }
+    const gusts = vals.map(v => v[2]).filter(g => g != null);
+    const speed = median(vals.map(v => v[0]));
+    d.hours.push({hour, agree, speed,
+      gust: gusts.length ? Math.max(median(gusts), speed) : speed,
+      dir: vecMean(vals).dir,
+      wave: marine ? at(marine.wave_height, i) : null,
+      period: marine ? at(marine.wave_period, i) : null});
+  });
+  for (const d of Object.values(days)) {
+    d.ok = d.hours.filter(h => h.agree >= 0.5);
+    d.window = d.ok.length ? `${String(d.ok[0].hour).padStart(2, "0")}-${String(d.ok[d.ok.length - 1].hour + 1).padStart(2, "0")}` : "-";
+    const src = d.ok.length ? d.ok : d.hours;
+    d.speed = mean(src.map(h => h.speed));
+    d.gust = mean(src.map(h => h.gust));
+    // direzione del giorno: tutte le coppie modello/ora della finestra, pesate sulla velocita'
+    const hrs = new Set(src.map(h => h.hour)), inWin = x => hrs.has(x[2]);
+    const pairs = Object.values(d.models).flatMap(v => v.filter(inWin));
+    const vm = vecMean(pairs);
+    d.dir = vm.dir;
+    d.dirSure = vm.r >= 0.7;
+    const w = src.map(h => h.wave).filter(x => x != null), p = src.map(h => h.period).filter(x => x != null);
+    d.wave = w.length ? Math.max(...w) : null;
+    d.period = p.length ? mean(p) : null;
+    d.modelAvg = Object.fromEntries(Object.entries(d.models).map(([l, v]) => {
+      const sel = v.filter(inWin);
+      return [l, sel.length ? {speed: mean(sel.map(x => x[0])), dir: vecMean(sel).dir} : null];
+    }).filter(([, v]) => v));
+  }
+  return days;
+}
+
+function verdict(d) {
+  if (d.ok.length >= 4 && d.score >= 4) return ["VAI", "go"];
+  if (d.ok.length >= 2) return ["forse", "maybe"];
+  return ["no", "no"];
+}
+
+const windy = s => `https://www.windy.com/${s.lat}/${s.lon}?wind,${s.lat},${s.lon},11`;
+
+function render(results, o) {
+  const dates = [...new Set(results.flatMap(([, days]) => Object.keys(days)))].sort();
+  const kites = d => `Reach ${kiteSize(d.speed, d.gust, o.weight, o.reach)} &middot; Evo ${kiteSize(d.speed, d.gust, o.weight, o.evo)}`;
+  const dirText = (d, s) => `${windName(d.dir, s)} ${cardinal(d.dir)} ${d.dir.toFixed(0)}&deg;${d.dirSure ? "" : " (incerta)"}`;
+  let h = "";
+  for (const day of dates) {
+    const rows = results.filter(([, d]) => d[day]).map(([s, d]) => [s, d[day]])
+      .sort((a, b) => b[1].score - a[1].score);
+    const [bs, bd] = rows[0];
+    const best = verdict(bd)[0] !== "no"
+      ? `Consiglio: <b>${esc(bs.name)}</b> (${bd.window}, ~${bd.speed.toFixed(0)} kn ${windName(bd.dir, bs)})
+         &rarr; vela <span class="kite">${kites(bd)} m&sup2;</span>`
+      : "Consiglio: niente di buono, giornata da riposo.";
+    const dd = new Date(day + "T12:00");
+    h += `<div class="day"><h2>${WEEKDAYS[dd.getDay()]} ${day.slice(8, 10)}/${day.slice(5, 7)}</h2>
+      <div class="best">${best}</div><table><tr><th>Spot</th><th>Verdetto</th><th>Finestra</th><th>Vento</th>
+      <th>Raffiche</th><th>Direzione</th><th>Vela (m&sup2;)</th><th>Onda</th><th>Medie modelli</th><th>Note</th></tr>`;
+    for (const [s, d] of rows) {
+      const [label, cls] = verdict(d);
+      const wave = d.wave != null ? `${d.wave.toFixed(1)} m / ${d.period.toFixed(0)}s` : "-";
+      const models = Object.entries(d.modelAvg)
+        .map(([l, v]) => `${l} ${v.speed.toFixed(0)}kn ${cardinal(v.dir)}`).join("<br>");
+      h += `<tr class="${cls}"><td><a href="${windy(s)}" target="_blank">${esc(s.name)}</a></td>
+        <td>${label} (${d.score.toFixed(1)})</td><td>${d.window}</td><td>${d.speed.toFixed(0)} kn</td>
+        <td>${d.gust.toFixed(0)} kn</td><td>${dirText(d, s)}</td><td class="kite">${label === "no" ? "-" : kites(d)}</td>
+        <td>${wave}</td><td class="m">${models}</td><td class="note">${esc(s.note)}</td></tr>`;
+    }
+    h += "</table></div>";
+  }
+  document.getElementById("out").innerHTML = h;
+}
+
+const FIELDS = ["min", "max", "start", "end", "days", "weight", "reach", "evo"];
+const SIZE_FIELDS = ["reach", "evo"];
+const parseSizes = t => t.split(/[,; ]+/).map(Number).filter(n => n > 0).sort((a, b) => a - b);
+function readOpts() {
+  const raw = Object.fromEntries(FIELDS.map(f => [f, document.getElementById(f).value]));
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(raw)); } catch (e) {}
+  return Object.fromEntries(FIELDS.map(f => [f, SIZE_FIELDS.includes(f) ? parseSizes(raw[f]) : +raw[f]]));
+}
+const STORE_KEY = "kiteOpts2";
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "{}");
+  FIELDS.forEach(f => { if (saved[f] != null) document.getElementById(f).value = saved[f]; });
+} catch (e) {}
+
+async function run() {
+  const status = document.getElementById("status");
+  status.textContent = "Caricamento previsioni...";
+  status.style.color = "#a00";
+  try {
+    const o = readOpts();
+    const data = await fetchAll(o.days);
+    render(data.map(([s, h, m]) => [s, analyse(s, h, m, o)]), o);
+    status.textContent = "Aggiornato " + new Date().toLocaleString("it-IT");
+    status.style.color = "#666";
+  } catch (e) {
+    status.textContent = "Errore nel caricamento: " + e.message;
+  }
+}
+document.getElementById("opts").addEventListener("submit", e => { e.preventDefault(); run(); });
+run();
+</script>
+</body>
+</html>
